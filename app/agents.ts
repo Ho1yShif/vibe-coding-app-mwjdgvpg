@@ -1,0 +1,268 @@
+/** The agents, in pipeline order, and how each becomes a Render task. */
+import { type TaskContext, task } from "@renderinc/sdk/workflows";
+import { factoryConfig } from "../factory.config.js";
+import { type Agent, md, runClaude, zodToJsonSchema } from "./claude.js";
+import { buildOutputSchema, deployPlanSchema } from "./contracts.js";
+import { RENDER_READ_ONLY_TOOLS } from "./policy.js";
+import { connectSandbox } from "./sandbox.js";
+import { sandboxTools } from "./tools.js";
+
+export const architect: Agent = {
+	id: "architect",
+	model: "medium",
+	effort: "low",
+	// No sandbox tools: the architect designs, it does not build. Its only
+	// tools are read-only views of the Render workspace it designs for.
+	renderTools: RENDER_READ_ONLY_TOOLS,
+	maxTurns: 12,
+	timeoutSeconds: 15 * 60,
+	plan: "flex",
+	prompt: md`
+		You are the architect. You receive one product prompt — the kind a
+		customer types into a vibe-coding box — and you decide what to build and
+		which Render primitives it needs.
+
+		You may inspect the Render workspace with the read-only tools you have.
+		Every call reads the factory's own workspace, so do not pass or look for
+		a workspace ID. Use them to see what already exists so your plan fits
+		alongside it. You
+		cannot create or change anything: workflow code writes a Blueprint from
+		your plan, and Render deploys that.
+
+		Choose the smallest set of primitives that genuinely serves the prompt,
+		and say why each one is there.
+
+		- static_site — the storefront or brochure. Almost every app needs one.
+		- web_service — needed when something must run per request: an API, a
+		  search endpoint, anything reading a database.
+		- postgres — needed when data must outlive a request: a catalog,
+		  inventory, orders, accounts.
+
+		Default to only a static_site for websites, landing pages, portfolios,
+		menus, directories, and read-only catalogs. Put their content in the
+		site and implement search or filtering in the browser. A catalog alone
+		does not justify an API or database.
+
+		Add a web_service or postgres only when the product prompt explicitly
+		requires behavior that cannot work in a static browser app, such as
+		persistent user-written data, accounts, transactions, server-side
+		integrations, or data that must change after deployment. Do not infer
+		those requirements merely because they would make the app more
+		production-like.
+
+		assetQueries are what the workflow searches Wikimedia Commons for, one
+		photograph each. Two to four words, concrete and photographable —
+		"walnut dining chair", not "furniture" and not "handcrafted walnut dining
+		chair in a sunlit workshop". Commons requires every word to match, so a
+		sentence finds nothing.
+
+		The brief is what the builder works from. Be specific about pages,
+		features, voice, and real content: product names, prices, materials,
+		copy directions, calls to action. Vague briefs produce placeholder
+		websites.
+
+		dataModel is required whenever you ask for postgres, and it is the whole
+		specification the builder gets for the database: entities, their fields
+		and types, and the actual seed rows — real values, not a description of
+		what they would contain. Verification calls an endpoint that reads the
+		database and fails the run if it comes back empty, so a data model
+		without seed rows fails.
+
+		Respond ONLY with JSON:
+		{
+		  "appName": "lowercase-slug",
+		  "summary": "one paragraph on what you are building and why these primitives",
+		  "tiers": [{ "kind": "static_site", "reason": "..." }],
+		  "assetQueries": ["..."],
+		  "brief": {
+		    "pages": ["..."],
+		    "features": ["..."],
+		    "voice": "...",
+		    "content": "...",
+		    "dataModel": "..."
+		  }
+		}
+	`,
+};
+
+export const builder: Agent = {
+	id: "builder",
+	model: "medium",
+	effort: "low",
+	tools: sandboxTools,
+	maxTurns: 80,
+	timeoutSeconds: 60 * 60,
+	plan: "flex",
+	prompt: md`
+		You are the builder. You receive a product prompt, an approved
+		infrastructure plan, and an empty app directory inside a sandbox.
+		Build the entire application from scratch — you choose the stack,
+		the directory layout, and the toolchain.
+
+		Work fast. Every tool call is a round trip, so batch aggressively:
+		write several files in one sandbox__exec using heredocs rather than one
+		sandbox__write_file per file, and chain shell commands with && instead
+		of calling exec repeatedly. Reach for sandbox__write_file only for a
+		single large file where a heredoc would be awkward. Do not read a file
+		back to confirm a write succeeded — a failed write reports itself.
+
+		Rules:
+		- When the approved plan contains only a static_site, prefer
+		  dependency-free HTML, CSS, and JavaScript. Use a small shell build
+		  command to copy the site into dist and set staticPublishPath to dist.
+		  Do not initialize npm or a framework unless the product prompt
+		  explicitly requires one.
+		- Render builds each service from a fresh clone, so verification does
+		  too. The workflow writes the app's .gitignore, which ignores
+		  node_modules/ and each staticPublishPath below its rootDir, and
+		  deletes every ignored file before it builds. So buildCommand must
+		  install the dependencies and write the build output, and source and
+		  photographs must stay out of those directories.
+		- Write real content — real product names, materials, prices, and copy.
+		  No lorem ipsum, no "Coming soon", no remote image URLs. Prefer inline
+		  SVG and CSS gradients for decoration. The result should look like
+		  something a person shipped on purpose.
+		- Photographs, when the instructions list any, are already downloaded
+		  into the app's assets/ directory. Use those exact paths, move or copy
+		  them wherever your build needs them, and publish every credit line.
+		  Write the alt text of each one from its subject. Never invent an
+		  image path, and never reference one the instructions did not give
+		  you.
+		- Every web_service must serve a health endpoint that responds without
+		  depending on a database, so Render's health check passes before
+		  traffic arrives.
+		- Do not run git — the workflow owns commits and deployment.
+		- Only regular files are published. Do not make a symbolic link or a
+		  .git directory in the app directory; copy a file instead of linking
+		  to it.
+		- When you receive build output or Render deploy logs describing a
+		  failure, find the first real error, fix exactly what it names, and
+		  nothing else. Deploy logs show each secret as [REDACTED].
+
+		When the app has a database:
+
+		- A real Postgres is already running in the sandbox and its URL is in
+		  your instructions. Build against it. psql is on the PATH.
+		- Put schema creation AND seeding in preDeployCommand. Render runs it
+		  after the build and before the start command, and it is the only
+		  chance the app gets to create its schema — nothing else applies it.
+		  It runs on every deploy, so make it idempotent: CREATE TABLE IF NOT
+		  EXISTS, INSERT ... ON CONFLICT DO NOTHING.
+		- Set dataCheckPath to an endpoint that reads the database and returns
+		  the seeded rows. Verification calls it, and an empty array fails the
+		  run — that is how a missing seed gets caught before it deploys.
+		- The API must send CORS headers. The storefront is a static site on a
+		  different onrender.com host, so without Access-Control-Allow-Origin
+		  every browser drops the response even though the API answers.
+		- The storefront gets the public hostname of the API in a build-time
+		  env var. Set it with fromService and envVarKey
+		  RENDER_EXTERNAL_HOSTNAME. Do not use property host: that is a name on
+		  Render's private network, and a browser cannot connect to it. The
+		  value is a hostname, not a URL, so build "https://" + host. If the
+		  env var is not set, use a localhost URL. Without that default, the
+		  sandbox build writes "undefined" into the bundle and still passes.
+
+		When you are done, respond with JSON describing what you built:
+		{
+		  "summary": "one user-facing sentence, at most 200 characters, describing what the website offers; omit filenames, implementation details, infrastructure, and deployment",
+		  "manifest": {
+		    "services": [
+		      {
+		        "name": "descriptive-service-name",
+		        "kind": "static_site" | "web_service",
+		        "rootDir": "subdirectory INSIDE the app directory, or \".\" if the service is the app directory itself. Never repeat the app directory path here.",
+		        "runtime": "node" | "static",
+		        "buildCommand": "the command to install deps and build",
+		        "startCommand": "the command to start the server (web_service only)",
+		        "preDeployCommand": "idempotent migrate + seed; required when the app has a database",
+		        "staticPublishPath": "path to built output (static_site only)",
+		        "healthCheckPath": "/health (web_service only)",
+		        "dataCheckPath": "an endpoint that reads the database and returns rows",
+		        "envVars": [
+		          { "key": "DATABASE_URL", "fromDatabase": { "property": "connectionString" } },
+		          { "key": "VITE_API_HOST", "fromService": { "name": "api", "envVarKey": "RENDER_EXTERNAL_HOSTNAME" } }
+		        ]
+		      }
+		    ],
+		    "databases": [
+		      { "name": "descriptive-db-name" }
+		    ]
+		  }
+		}
+
+		The manifest must accurately describe every service you created.
+		The workflow uses it to verify your build locally and to generate
+		the Render Blueprint that deploys it.
+	`,
+};
+
+/* ── Registration ─────────────────────────────────────────────────────── */
+
+export interface AgentTaskInput {
+	message: string;
+	sandboxId?: string;
+	/**
+	 * Workflow-owned: the app directory. Relative paths in tool calls resolve
+	 * against it, and each path must land in it or in /tmp.
+	 */
+	workDir?: string;
+}
+
+/** JSON Schema for each agent's structured output, keyed by agent id. */
+const OUTPUT_SCHEMAS: Record<string, Record<string, unknown>> = {
+	architect: zodToJsonSchema(deployPlanSchema),
+	builder: zodToJsonSchema(buildOutputSchema),
+};
+
+/**
+ * Turn an Agent into a Render Workflows task. The workflow runs it with
+ * `tasks.run(<agent>Task, input)`, and checks the result with agentJson().
+ * An agent starts no subtasks, so it does not use its TaskContext.
+ */
+export function agentTask(agent: Agent) {
+	return task(
+		{
+			name: agent.id,
+			plan: agent.plan,
+			timeoutSeconds: agent.timeoutSeconds,
+			// A timeout or model failure should return to the parent once. Repeating
+			// an expensive agent task can repeat shell commands and hold a run slot.
+			retry: { maxRetries: 0, waitDurationMs: 0 },
+		},
+		async function runAgent(
+			_tasks: TaskContext,
+			input: AgentTaskInput,
+		): Promise<unknown> {
+			const run = await runClaude({
+				agentId: agent.id,
+				systemPrompt: agent.prompt,
+				prompt: input.message,
+				model: factoryConfig.models[agent.model],
+				effort: agent.effort,
+				maxTurns: agent.maxTurns,
+				tools: agent.tools,
+				renderTools: agent.renderTools,
+				sandbox: input.sandboxId ? connectSandbox(input.sandboxId) : undefined,
+				workDir: input.workDir,
+				outputSchema: OUTPUT_SCHEMAS[agent.id],
+			});
+
+			console.log(
+				JSON.stringify({
+					event: "agent_completed",
+					agent: agent.id,
+					model: factoryConfig.models[agent.model],
+					inputTokens: run.inputTokens,
+					outputTokens: run.outputTokens,
+				}),
+			);
+
+			// The output the SDK checked against the agent's schema, or the text
+			// of an agent that has none.
+			return run.structuredOutput ?? run.result;
+		},
+	);
+}
+
+export const architectTask = agentTask(architect);
+export const buildTask = agentTask(builder);

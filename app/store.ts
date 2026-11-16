@@ -1,0 +1,506 @@
+/** Postgres: one runs table. Render filesystems are ephemeral. */
+import pg from "pg";
+import { factoryConfig } from "../factory.config.js";
+
+export type RunStatus =
+	| "running"
+	| "deployed"
+	| "awaiting_blueprint"
+	| "build_failed"
+	| "deploy_failed"
+	| "failed"
+	// While a delete of the run's app runs, and after it fails. A delete that
+	// succeeds removes the row.
+	| "deleting"
+	| "delete_failed";
+
+/** The statuses a prompt-to-app run ends in. */
+export type FinishedStatus = Exclude<
+	RunStatus,
+	"running" | "deleting" | "delete_failed"
+>;
+
+/**
+ * Coarse progress for GET /v1/apps/:runId, in pipeline order. Cosmetic;
+ * never gates a run. The stage table in public/index.html must list these
+ * stages in this order, and tests/gateway.test.ts checks it. If a run's stage
+ * is not in that table, the UI shows no progress for the run.
+ */
+export const RUN_STAGES = [
+	"designing",
+	"provisioning",
+	"curating",
+	"building",
+	"verifying",
+	"publishing",
+	"waiting_for_services",
+	"waiting_for_deploys",
+	"smoke_testing",
+	"done",
+] as const;
+
+export type RunStage = (typeof RUN_STAGES)[number];
+
+export interface RunRecord {
+	id: string;
+	idempotencyKey: string;
+	prompt: string;
+	user: string;
+	status: RunStatus;
+	stage: RunStage | null;
+	progress: string | null;
+	/**
+	 * When the run went into each stage, in order. A stage that the run went
+	 * into again has one more item.
+	 */
+	stageHistory: { stage: RunStage; startedAt: string }[];
+	workflowRunId: string | null;
+	appName: string | null;
+	webUrl: string | null;
+	apiUrl: string | null;
+	blueprintPath: string | null;
+	summary: string | null;
+	/** The sandbox of the run and its sandbox group, for a dashboard link. */
+	sandboxId: string | null;
+	sandboxGroupId: string | null;
+	createdAt: string;
+	updatedAt: string;
+	/** When the run stopped, or null while it runs. */
+	finishedAt: string | null;
+}
+
+export type ClaimResult =
+	| { claimed: true }
+	| { claimed: false; reason: "duplicate"; runId: string }
+	| { claimed: false; reason: "at_capacity" };
+
+export type AppClaim =
+	| { claimed: true }
+	/** A delete of the app is in progress. */
+	| { claimed: false; reason: "deleting" }
+	/** A different run builds the app now. */
+	| { claimed: false; reason: "running" };
+
+export type DeleteClaim =
+	| { claimed: true; runIds: string[] }
+	/** A delete of the app is already in progress. */
+	| { claimed: false; reason: "deleting"; runIds: string[] }
+	/** A running run would publish the app again. */
+	| { claimed: false; reason: "running" }
+	| { claimed: false; reason: "missing" };
+
+const COLUMNS = `id, idempotency_key, prompt, user_name, status, stage, progress,
+	                stage_history, workflow_run_id,
+	                app_name, web_url, api_url, blueprint_path, summary,
+	                sandbox_id, sandbox_group_id,
+	                created_at, updated_at, finished_at`;
+
+let pool: pg.Pool | undefined;
+
+export function db(): pg.Pool {
+	if (!pool) {
+		const connectionString = process.env.DATABASE_URL;
+		if (!connectionString) throw new Error("DATABASE_URL is not set");
+		pool = new pg.Pool({
+			connectionString,
+			max: 2,
+			application_name: "vibe-factory",
+			connectionTimeoutMillis: 5_000,
+			idleTimeoutMillis: 10_000,
+			allowExitOnIdle: true,
+			options: "-c statement_timeout=15000 -c lock_timeout=5000",
+		});
+		// Postgres can close an idle connection of the pool, for example in a
+		// restart or a failover. The pool then removes the client and emits
+		// "error". If no listener gets the event, Node stops the process. The
+		// next query gets a new connection, so the listener only logs the error.
+		pool.on("error", (error) => {
+			console.error("Lost an idle Postgres connection:", error);
+		});
+	}
+	return pool;
+}
+
+export async function ping(): Promise<void> {
+	await db().query("select 1");
+}
+
+/**
+ * The advisory lock of claimRun: any fixed key. withAppLock takes the
+ * two-key form, and Postgres keeps the one-key and two-key lock spaces
+ * apart, so no app lock is this lock.
+ */
+const RUN_CLAIM_LOCK = 0x76696265;
+
+/**
+ * Run statements in one transaction holding one app's lock. A delete takes
+ * the lock to claim the app's runs, and a run takes it to claim an app name.
+ * So a run cannot start building an app while it is being deleted, or while
+ * another run builds it.
+ */
+function withAppLock<T>(
+	user: string,
+	appName: string,
+	work: (client: pg.PoolClient) => Promise<T>,
+): Promise<T> {
+	return withLock(
+		"select pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+		[user, appName],
+		work,
+	);
+}
+
+/** Run statements in one transaction that holds an advisory lock. */
+async function withLock<T>(
+	lock: string,
+	values: readonly unknown[],
+	work: (client: pg.PoolClient) => Promise<T>,
+): Promise<T> {
+	const client = await db().connect();
+	// The pool listens for "error" only on an idle client. If Postgres closes
+	// the connection during the transaction, for example in a restart or a
+	// failover, the client emits "error". If no listener gets the event, Node
+	// stops the process. The query fails too, and its error goes to the
+	// caller, so this listener only logs the error.
+	const logError = (error: Error) => {
+		console.error("Lost a Postgres connection in a transaction:", error);
+	};
+	client.on("error", logError);
+	try {
+		await client.query("begin");
+		// The lock must come before the reads: a statement sees only the rows
+		// that were committed when it started.
+		await client.query(lock, [...values]);
+		const result = await work(client);
+		await client.query("commit");
+		return result;
+	} catch (error) {
+		await client.query("rollback").catch(() => {});
+		throw error;
+	} finally {
+		// release() reattaches the pool's listener. If this one stayed, each
+		// transaction on the client would add another.
+		client.off("error", logError);
+		client.release();
+	}
+}
+
+/**
+ * Claim a run. The unique idempotency key stops a duplicate curl, and the
+ * conditional insert stops the factory from running more sandboxes than it
+ * should.
+ *
+ * Under READ COMMITTED, two concurrent inserts each count the running rows
+ * without seeing the other's row, so both could pass the cap. Each claim
+ * therefore holds one advisory lock and counts only after the previous claim
+ * commits.
+ */
+export function claimRun(input: {
+	id: string;
+	idempotencyKey: string;
+	prompt: string;
+	user: string;
+}): Promise<ClaimResult> {
+	return withLock(
+		"select pg_advisory_xact_lock($1::bigint)",
+		[RUN_CLAIM_LOCK],
+		async (client): Promise<ClaimResult> => {
+			const inserted = await client.query(
+				`insert into runs (id, idempotency_key, prompt, user_name)
+				 select $1, $2, $3, $4
+				 where (select count(*) from runs where status = 'running') < $5
+				 on conflict (idempotency_key) do nothing`,
+				[
+					input.id,
+					input.idempotencyKey,
+					input.prompt,
+					input.user,
+					factoryConfig.maxConcurrentRuns,
+				],
+			);
+			if (inserted.rowCount === 1) return { claimed: true };
+
+			// Nothing inserted: either the key was seen before or we are at capacity.
+			const { rows } = await client.query<{ id: string }>(
+				"select id from runs where idempotency_key = $1",
+				[input.idempotencyKey],
+			);
+			return rows.length > 0
+				? { claimed: false, reason: "duplicate", runId: rows[0].id }
+				: { claimed: false, reason: "at_capacity" };
+		},
+	);
+}
+
+/**
+ * Each change of stage adds the stage and the time to stage_history, so that
+ * the UI can show how long each stage took.
+ */
+export async function setRunStage(
+	id: string,
+	stage: RunStage,
+	progress: string | null = null,
+): Promise<void> {
+	await db().query(
+		`update runs
+		 set stage = $2, progress = $3,
+		     stage_history = stage_history ||
+		       jsonb_build_array(jsonb_build_object('stage', $2::text, 'started_at', now())),
+		     updated_at = now()
+		 where id = $1`,
+		[id, stage, progress],
+	);
+}
+
+export async function touchRun(id: string, progress: string): Promise<void> {
+	await db().query(
+		"update runs set progress = $2, updated_at = now() where id = $1 and status = 'running'",
+		[id, progress],
+	);
+}
+
+export async function setWorkflowRunId(
+	id: string,
+	workflowRunId: string,
+): Promise<void> {
+	await db().query(
+		"update runs set workflow_run_id = $2, updated_at = now() where id = $1",
+		[id, workflowRunId],
+	);
+}
+
+/** Throttle status reconciliation across gateway instances. */
+export async function claimWorkflowCheck(id: string): Promise<boolean> {
+	const result = await db().query(
+		`update runs
+		 set workflow_checked_at = now()
+		 where id = $1
+		   and status in ('running', 'deleting')
+		   and (workflow_checked_at is null or workflow_checked_at < now() - interval '30 seconds')`,
+		[id],
+	);
+	return result.rowCount === 1;
+}
+
+/**
+ * Record the app a run builds. Refused while the same app is being deleted,
+ * because the delete would remove what this run publishes. Also refused while
+ * another run builds the app: both would write the same directory and wait on
+ * each other's deploys.
+ */
+export async function claimRunApp(
+	id: string,
+	user: string,
+	app: { appName: string; blueprintPath: string },
+): Promise<AppClaim> {
+	return withAppLock(user, app.appName, async (client) => {
+		const { rows } = await client.query<{ status: RunStatus }>(
+			`select status from runs
+			 where user_name = $1 and app_name = $2 and id <> $3
+			   and status in ('running', 'deleting')`,
+			[user, app.appName, id],
+		);
+		if (rows.some((row) => row.status === "deleting")) {
+			return { claimed: false, reason: "deleting" };
+		}
+		if (rows.length > 0) return { claimed: false, reason: "running" };
+
+		await client.query(
+			`update runs set app_name = $2, blueprint_path = $3, updated_at = now()
+			 where id = $1`,
+			[id, app.appName, app.blueprintPath],
+		);
+		return { claimed: true };
+	});
+}
+
+/**
+ * Mark every run of one app as deleting. The runs share the app's files and
+ * resources, so they are deleted together. A second request while the delete
+ * is in progress changes nothing.
+ */
+export async function claimDelete(
+	user: string,
+	appName: string,
+): Promise<DeleteClaim> {
+	return withAppLock(user, appName, async (client) => {
+		const { rows } = await client.query<{ id: string; status: RunStatus }>(
+			"select id, status from runs where user_name = $1 and app_name = $2",
+			[user, appName],
+		);
+		if (rows.length === 0) return { claimed: false, reason: "missing" };
+		if (rows.some((row) => row.status === "running")) {
+			return { claimed: false, reason: "running" };
+		}
+		const runIds = rows.map((row) => row.id);
+		if (rows.some((row) => row.status === "deleting")) {
+			return { claimed: false, reason: "deleting", runIds };
+		}
+
+		await client.query(
+			`update runs
+			 set status = 'deleting', progress = 'Waiting for the delete to start',
+			     workflow_run_id = null, updated_at = now()
+			 where user_name = $1 and app_name = $2`,
+			[user, appName],
+		);
+		return { claimed: true, runIds };
+	});
+}
+
+/**
+ * Delete a run that never chose an app. It created nothing but its row, so
+ * no task is necessary. Returns false for a run that is still running.
+ */
+export async function deleteRunWithoutApp(id: string): Promise<boolean> {
+	const result = await db().query(
+		"delete from runs where id = $1 and app_name is null and status <> 'running'",
+		[id],
+	);
+	return result.rowCount === 1;
+}
+
+/** Reconciliation reads this task run while the rows are deleting. */
+export async function setDeleteWorkflowRunId(
+	user: string,
+	appName: string,
+	workflowRunId: string,
+): Promise<void> {
+	await db().query(
+		`update runs set workflow_run_id = $3, updated_at = now()
+		 where user_name = $1 and app_name = $2 and status = 'deleting'`,
+		[user, appName, workflowRunId],
+	);
+}
+
+export async function setDeleteProgress(
+	user: string,
+	appName: string,
+	progress: string,
+): Promise<void> {
+	await db().query(
+		`update runs set progress = $3, updated_at = now()
+		 where user_name = $1 and app_name = $2 and status = 'deleting'`,
+		[user, appName, progress.slice(0, 500)],
+	);
+}
+
+/**
+ * The runs stay, so that the user can read why and delete them again. With a
+ * task run ID, only the runs of that task change: a newer delete may own them.
+ */
+export async function failDelete(
+	user: string,
+	appName: string,
+	summary: string,
+	workflowRunId?: string,
+): Promise<void> {
+	await db().query(
+		`update runs set status = 'delete_failed', progress = null, summary = $3,
+		                 updated_at = now()
+		 where user_name = $1 and app_name = $2 and status = 'deleting'
+		   and ($4::text is null or workflow_run_id = $4)`,
+		[user, appName, summary, workflowRunId ?? null],
+	);
+}
+
+/** The last step of a delete: the app is gone, so its runs go too. */
+export async function deleteRuns(user: string, appName: string): Promise<void> {
+	await db().query(
+		"delete from runs where user_name = $1 and app_name = $2 and status = 'deleting'",
+		[user, appName],
+	);
+}
+
+/** Cosmetic, as the stage is: the UI links to the sandbox in the Dashboard. */
+export async function setRunSandbox(
+	id: string,
+	sandbox: { id: string; groupId: string | null },
+): Promise<void> {
+	await db().query(
+		"update runs set sandbox_id = $2, sandbox_group_id = $3 where id = $1",
+		[id, sandbox.id, sandbox.groupId],
+	);
+}
+
+export async function setRunUrls(
+	id: string,
+	urls: { webUrl: string | null; apiUrl: string | null },
+): Promise<void> {
+	await db().query(
+		`update runs set web_url = $2, api_url = $3, updated_at = now()
+		 where id = $1`,
+		[id, urls.webUrl, urls.apiUrl],
+	);
+}
+
+/** Moving off 'running' frees a concurrency slot. */
+export async function finishRun(
+	id: string,
+	status: FinishedStatus,
+	details: { summary?: string } = {},
+): Promise<void> {
+	await db().query(
+		`update runs
+		 set status = $2,
+		     stage = case when $2 in ('deployed', 'awaiting_blueprint') then 'done' else stage end,
+		     progress = null,
+		     summary = $3, updated_at = now(), finished_at = now()
+		 where id = $1`,
+		[id, status, details.summary ?? null],
+	);
+}
+
+export async function getRun(id: string): Promise<RunRecord | null> {
+	const { rows } = await db().query(
+		`select ${COLUMNS} from runs where id = $1`,
+		[id],
+	);
+	if (rows.length === 0) return null;
+	return rowToRun(rows[0]);
+}
+
+export async function listRunsByUser(
+	user: string,
+	limit = 50,
+): Promise<RunRecord[]> {
+	const { rows } = await db().query(
+		`select ${COLUMNS} from runs
+		 where user_name = $1
+		 order by created_at desc
+		 limit $2`,
+		[user, limit],
+	);
+	return rows.map(rowToRun);
+}
+
+function rowToRun(row: Record<string, unknown>): RunRecord {
+	return {
+		id: String(row.id),
+		idempotencyKey: String(row.idempotency_key),
+		prompt: String(row.prompt),
+		user: String(row.user_name),
+		status: row.status as RunStatus,
+		stage: (row.stage as RunStage | null) ?? null,
+		progress: (row.progress as string | null) ?? null,
+		// Postgres writes JSON timestamps in the session's offset. Return UTC, like
+		// the run's other timestamps.
+		stageHistory: (
+			row.stage_history as { stage: RunStage; started_at: string }[]
+		).map((item) => ({
+			stage: item.stage,
+			startedAt: new Date(item.started_at).toISOString(),
+		})),
+		workflowRunId: (row.workflow_run_id as string | null) ?? null,
+		appName: (row.app_name as string | null) ?? null,
+		webUrl: (row.web_url as string | null) ?? null,
+		apiUrl: (row.api_url as string | null) ?? null,
+		blueprintPath: (row.blueprint_path as string | null) ?? null,
+		summary: (row.summary as string | null) ?? null,
+		sandboxId: (row.sandbox_id as string | null) ?? null,
+		sandboxGroupId: (row.sandbox_group_id as string | null) ?? null,
+		createdAt: (row.created_at as Date).toISOString(),
+		updatedAt: (row.updated_at as Date).toISOString(),
+		finishedAt: row.finished_at ? (row.finished_at as Date).toISOString() : null,
+	};
+}

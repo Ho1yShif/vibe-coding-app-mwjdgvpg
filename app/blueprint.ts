@@ -1,0 +1,412 @@
+/**
+ * Blueprint generation.
+ *
+ * This is the factory's only path that creates infrastructure on Render.
+ * Nothing here calls an API: it produces YAML, the workflow commits it, and
+ * Render's Blueprint sync creates and deploys whatever changed. That means
+ * every piece of infrastructure the factory has ever created is reviewable in
+ * Git, and an agent cannot provision anything without a commit. A Blueprint
+ * change never deletes a resource, so app/teardown.ts deletes the resources
+ * of a deleted app.
+ *
+ * Blueprints are generated from the agent-declared service manifest, not from
+ * constants. The manifest is what the builder says it built: directories,
+ * commands, health paths, env var wiring.
+ *
+ * Each app is its own Render project, so the Dashboard groups an app's site,
+ * API, and database instead of mixing every app in one workspace list.
+ */
+import { factoryConfig, appRelativePath } from "../factory.config.js";
+import type { AppSpec, Manifest, Service } from "./contracts.js";
+
+/** Render requires a project to have an environment; an app needs only one. */
+const ENVIRONMENT = "production";
+
+export interface ResourceNames {
+	/** Render resource name for every manifest service, keyed by manifest name. */
+	services: Map<string, string>;
+	/** Render resource name for every manifest database, keyed by manifest name. */
+	databases: Map<string, string>;
+	/** The primary storefront, if the app has one. Reported as the app's URL. */
+	web: string | null;
+	/** The primary API, if the app has one. */
+	api: string | null;
+	/** The primary database, which an unqualified `fromDatabase` refers to. */
+	db: string | null;
+}
+
+/**
+ * The name every resource of one app starts with, which also names the app's
+ * project. Render resource names are unique per workspace, and the root
+ * Blueprint holds every generated app at once, so the user and app names both
+ * have to be in here. Components are truncated to keep the whole name within
+ * Render's limit.
+ */
+export function resourceStem(
+	spec: Pick<AppSpec, "resourcePrefix" | "user" | "appName">,
+): string {
+	return [
+		spec.resourcePrefix,
+		spec.user.slice(0, 12),
+		spec.appName.slice(0, 24),
+	].join("-");
+}
+
+/**
+ * The first storefront, API, and database keep the `-web`, `-api`, and `-db`
+ * names the factory has always used. Anything beyond them is named after
+ * itself: the manifest allows six services and three databases, and two
+ * resources that collapse onto one name silently overwrite each other in the
+ * Blueprint rather than failing.
+ */
+export function resourceNames(spec: AppSpec): ResourceNames {
+	const stem = resourceStem(spec);
+
+	const taken = new Set<string>();
+	const claim = (suffix: string): string => {
+		const base = `${stem}-${suffix}`;
+		let name = base;
+		for (let n = 2; taken.has(name); n++) name = `${base}-${n}`;
+		taken.add(name);
+		return name;
+	};
+
+	const services = new Map<string, string>();
+	let web: string | null = null;
+	let api: string | null = null;
+
+	for (const service of spec.manifest.services) {
+		const primary =
+			service.kind === "static_site" ? web === null : api === null;
+		const name = claim(primary ? roleOf(service) : slugify(service.name));
+		services.set(service.name, name);
+		if (primary && service.kind === "static_site") web = name;
+		if (primary && service.kind === "web_service") api = name;
+	}
+
+	const databases = new Map<string, string>();
+	let db: string | null = null;
+	for (const database of spec.manifest.databases ?? []) {
+		const name = claim(db === null ? "db" : slugify(database.name));
+		databases.set(database.name, name);
+		db ??= name;
+	}
+
+	return { services, databases, web, api, db };
+}
+
+/**
+ * Every Render resource that the spec declares, as "<name> (<runtime>)",
+ * sorted. Two specs with the same list differ only in settings that a
+ * Blueprint sync changes in place. Render cannot change the runtime of a
+ * service, and it does not delete a resource that leaves the Blueprint.
+ */
+export function declaredResources(spec: AppSpec): string[] {
+	const names = resourceNames(spec);
+	return [
+		...spec.manifest.services.map(
+			(service) =>
+				`${names.services.get(service.name)} (${runtimeOf(service)})`,
+		),
+		...(spec.manifest.databases ?? []).map(
+			(database) => `${names.databases.get(database.name)} (postgres)`,
+		),
+	].sort();
+}
+
+function roleOf(service: Service): string {
+	return service.kind === "static_site" ? "web" : "api";
+}
+
+function runtimeOf(service: Service): string {
+	return service.kind === "static_site" ? "static" : service.runtime;
+}
+
+/** A manifest-supplied name, reduced to something Render accepts. */
+function slugify(name: string): string {
+	return (
+		name
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-|-$/g, "")
+			.slice(0, 20) || "svc"
+	);
+}
+
+/**
+ * The Blueprint for one app, committed beside it. Deployable on its own by
+ * pointing a new Blueprint at this path, which is how a generated app can
+ * graduate out of the factory's shared Blueprint. It declares the same project,
+ * so a graduated app keeps its grouping.
+ */
+export function appBlueprint(spec: AppSpec): string {
+	return [
+		`# ${spec.user}/${spec.appName} — generated by vibe-coding-app.`,
+		`# Prompt: ${oneLine(spec.prompt)}`,
+		"",
+		"projects:",
+		...projectBlock(spec),
+	].join("\n");
+}
+
+/**
+ * The repository-root Blueprint: every generated app in one file, each as its
+ * own project. This is the file Render watches, so appending an app to it is
+ * what deploys that app. Regenerated from every apps/<user>/<app>/factory.json
+ * on each run, which is why the specs are stored as JSON rather than parsed
+ * back out of YAML.
+ *
+ * An app with deletedAt is left out. Its resources must leave the Blueprint
+ * before they are deleted, because a sync recreates a declared resource that
+ * is missing.
+ */
+export function rootBlueprint(specs: readonly AppSpec[]): string {
+	const ordered = specs
+		.filter((spec) => !spec.deletedAt)
+		.sort((a, b) =>
+			`${a.user}/${a.appName}`.localeCompare(`${b.user}/${b.appName}`),
+		);
+
+	const header = [
+		"# Generated by vibe-coding-app. Do not edit by hand.",
+		"#",
+		"# One Blueprint holds every app the factory has built, each in its own",
+		"# project. A run appends its app here, and Render's Blueprint sync",
+		"# deploys it.",
+		`# Apps: ${ordered.length}`,
+		"",
+	];
+
+	if (ordered.length === 0) {
+		return [
+			...header,
+			"# No apps yet. The first run will add one.",
+			"services: []",
+			"",
+		].join("\n");
+	}
+
+	return [...header, "projects:", ...ordered.flatMap(projectBlock), ""].join(
+		"\n",
+	);
+}
+
+/* ── YAML generation from manifest ────────────────────────────────────── */
+
+/**
+ * One app as a project entry. The project takes the stem its resources share,
+ * so it is unique in the root Blueprint for the same reason they are. An app
+ * deployed before projects existed moves into its environment on the next
+ * sync; a Blueprint change never deletes a resource.
+ */
+function projectBlock(spec: AppSpec): string[] {
+	const root = appRelativePath(spec.user, spec.appName);
+	const names = resourceNames(spec);
+	return [
+		`  # ── ${spec.user}/${spec.appName} ${"─".repeat(20)}`,
+		`  - name: ${resourceStem(spec)}`,
+		"    environments:",
+		`      - name: ${ENVIRONMENT}`,
+		"        services:",
+		...indent(serviceBlocks(spec.manifest, root, names), 8),
+		...indent(databaseBlocks(spec.manifest, names), 8),
+	];
+}
+
+/** The service and database blocks are written for the top level. */
+function indent(lines: readonly string[], spaces: number): string[] {
+	const pad = " ".repeat(spaces);
+	return lines.map((line) => `${pad}${line}`);
+}
+
+function serviceBlocks(
+	manifest: Manifest,
+	root: string,
+	names: ResourceNames,
+): string[] {
+	const lines: string[] = [];
+
+	for (const service of manifest.services) {
+		const resourceName = names.services.get(service.name);
+		if (!resourceName) continue;
+		lines.push(...singleServiceBlock(service, root, resourceName, names));
+	}
+
+	return lines;
+}
+
+function singleServiceBlock(
+	service: Service,
+	root: string,
+	resourceName: string,
+	names: ResourceNames,
+): string[] {
+	const lines: string[] = [];
+	const isStatic = service.kind === "static_site";
+
+	const serviceDir = joinServiceDir(root, service.rootDir);
+
+	lines.push(
+		"  - type: web",
+		`    name: ${resourceName}`,
+		`    runtime: ${runtimeOf(service)}`,
+	);
+	// Static sites are served from the global CDN — no region field.
+	if (!isStatic) {
+		lines.push(`    plan: ${factoryConfig.render.servicePlan}`);
+		lines.push(`    region: ${factoryConfig.render.region}`);
+	}
+	lines.push(
+		`    rootDir: ${yamlString(serviceDir)}`,
+		`    buildCommand: ${yamlString(service.buildCommand)}`,
+	);
+
+	// Runs after the build with the service's env vars wired, which makes it
+	// the only place a generated app can create its schema. A failure here is
+	// a pre_deploy_failed deploy, so a broken migration is a visible failure
+	// rather than an app serving an empty database.
+	if (service.preDeployCommand) {
+		lines.push(`    preDeployCommand: ${yamlString(service.preDeployCommand)}`);
+	}
+	if (!isStatic && service.startCommand) {
+		lines.push(`    startCommand: ${yamlString(service.startCommand)}`);
+	}
+	if (isStatic && service.staticPublishPath) {
+		lines.push(
+			`    staticPublishPath: ${yamlString(service.staticPublishPath)}`,
+		);
+	}
+	if (!isStatic && service.healthCheckPath) {
+		lines.push(`    healthCheckPath: ${yamlString(service.healthCheckPath)}`);
+	}
+
+	lines.push(
+		"    autoDeployTrigger: commit",
+		"    buildFilter:",
+		"      paths:",
+		`        - ${yamlString(`${serviceDir}/**`)}`,
+	);
+
+	const envLines: string[] = [];
+	for (const envVar of service.envVars ?? []) {
+		if (envVar.fromDatabase) {
+			const target =
+				(envVar.fromDatabase.name &&
+					names.databases.get(envVar.fromDatabase.name)) ||
+				names.db;
+			if (!target) continue;
+			envLines.push(
+				`      - key: ${yamlString(envVar.key)}`,
+				"        fromDatabase:",
+				`          name: ${target}`,
+				`          property: ${yamlString(envVar.fromDatabase.property)}`,
+			);
+		} else if (envVar.fromService) {
+			const target = resolveFromServiceName(envVar.fromService.name, names);
+			if (!target) continue;
+			// The storefront uses envVarKey RENDER_EXTERNAL_HOSTNAME. The `host`
+			// property is a name on the private network, and a browser cannot
+			// connect to it.
+			const { property, envVarKey } = envVar.fromService;
+			envLines.push(
+				`      - key: ${yamlString(envVar.key)}`,
+				"        fromService:",
+				`          name: ${target}`,
+				"          type: web",
+				envVarKey
+					? `          envVarKey: ${yamlString(envVarKey)}`
+					: `          property: ${yamlString(property ?? "")}`,
+			);
+		}
+	}
+	if (envLines.length > 0) {
+		lines.push("    envVars:", ...envLines);
+	}
+
+	return lines;
+}
+
+/**
+ * Resolve a service reference in the manifest to a Render resource name. The
+ * builder names its own services, so prefer what it declared and fall back to
+ * the "api"/"web" roles it may have used instead.
+ */
+function resolveFromServiceName(
+	reference: string,
+	names: ResourceNames,
+): string | null {
+	return (
+		names.services.get(reference) ??
+		(reference === "api" ? names.api : null) ??
+		(reference === "web" ? names.web : null) ??
+		names.api ??
+		names.web
+	);
+}
+
+function databaseBlocks(manifest: Manifest, names: ResourceNames): string[] {
+	const databases = manifest.databases ?? [];
+	if (databases.length === 0) return [];
+
+	const lines = ["databases:"];
+	for (const database of databases) {
+		const name = names.databases.get(database.name);
+		if (!name) continue;
+		lines.push(
+			`  - name: ${name}`,
+			`    plan: ${factoryConfig.render.databasePlan}`,
+			`    region: ${factoryConfig.render.region}`,
+			`    postgresMajorVersion: "${factoryConfig.render.postgresMajorVersion}"`,
+			"    ipAllowList: []",
+		);
+	}
+	return lines.length > 1 ? lines : [];
+}
+
+/**
+ * Join a directory of the manifest onto a base directory: a rootDir onto the
+ * app, or a staticPublishPath onto its service. The manifest is
+ * agent-authored, so tolerate the two things models get wrong: "." or "./"
+ * for the base itself, and a path that repeats the base or its end. The
+ * Blueprint and verify-app both use this, so they agree on each directory.
+ */
+export function joinServiceDir(base: string, dir: string): string {
+	const cleaned = dir.replace(/^\.\/+/, "").replace(/\/+$/, "");
+	if (!cleaned || cleaned === "." || cleaned === base) return base;
+	if (base.endsWith(`/${cleaned}`)) return base;
+	return `${base}/${cleaned}`;
+}
+
+/**
+ * Write a free-form value as a double-quoted YAML scalar.
+ *
+ * The builder writes these values, and they can contain YAML syntax. Without
+ * quotes, `echo "build: done"` stops the parse of the full root Blueprint,
+ * `npm ci # install` loses the text after `#`, and `true` becomes a boolean.
+ *
+ * A JSON string is also a double-quoted YAML scalar, but JSON does not escape
+ * all characters. YAML 1.1 parsers, such as go-yaml and PyYAML, do not accept
+ * a raw DEL, C1 control, U+FFFE, or U+FFFF. They read a raw NEL, U+2028, or
+ * U+2029 as a line break. This function escapes these characters too. A lone
+ * surrogate becomes U+FFFD, because go-yaml does not accept the `\udXXX`
+ * escape that JSON gives it.
+ *
+ * Resource names and keywords such as `runtime` and `plan` do not use this
+ * function. They are slugs or values from a fixed set, so they cannot contain
+ * YAML syntax.
+ */
+function yamlString(value: string): string {
+	return JSON.stringify(value.replace(/\p{Cs}/gu, "\u{fffd}")).replace(
+		/[\u{7f}-\u{9f}\u{2028}\u{2029}\u{fffe}\u{ffff}]/gu,
+		(char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+	);
+}
+
+/**
+ * The prompt goes in a comment, and a comment stops at a line break. YAML 1.1
+ * parsers also read NEL as a line break, and they do not accept control
+ * characters, U+FFFE, or U+FFFF. This function changes all of them to spaces.
+ */
+function oneLine(value: string): string {
+	return value.replace(/[\s\p{Cc}\u{fffe}\u{ffff}]+/gu, " ").slice(0, 160);
+}
